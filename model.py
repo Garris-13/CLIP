@@ -17,6 +17,7 @@ class Bottleneck(nn.Module):
         self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = nn.ReLU(inplace=True)
+        # 利用1×1的卷积降维减少计算量
 
         self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
@@ -33,34 +34,42 @@ class Bottleneck(nn.Module):
         self.downsample = None
         self.stride = stride
 
+        # 形状不匹配（分辨率变了/通道数变了）则下采样
         if stride > 1 or inplanes != planes * Bottleneck.expansion:
             # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
+            #这么做使得原图像每一个像素不会被浪费，而Resnet直接用stride=2 的 1 × 1 卷积，一下字把“缩小尺寸”和“调整通道”这两件事同时办了，这样会导致大部分特征丢失
+            #顺序执行有序字典里的内容
             self.downsample = nn.Sequential(OrderedDict([
-                ("-1", nn.AvgPool2d(stride)),
+                ("-1", nn.AvgPool2d(stride)),#空间降采样，“-1”指前置处理，与主分支的avgpool对应
                 ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
                 ("1", nn.BatchNorm2d(planes * self.expansion))
             ]))
+    # 通过conv1先压缩到64，在64通道上做3×3卷积，再用conv3恢复，计算量远小于在原来的256通道上做3×3卷积(减少计算成本)
 
+    #
     def forward(self, x: torch.Tensor):
-        identity = x
+        identity = x #恒等映射，保留原始输入
 
-        out = self.relu1(self.bn1(self.conv1(x)))
-        out = self.relu2(self.bn2(self.conv2(out)))
-        out = self.avgpool(out)
-        out = self.bn3(self.conv3(out))
+        out = self.relu1(self.bn1(self.conv1(x))) #降维，通道压缩
+        out = self.relu2(self.bn2(self.conv2(out))) #空间特征提取
+        out = self.avgpool(out) #分辨率下采样（不丢弃空间像素）
+        out = self.bn3(self.conv3(out)) #恢复通道，升维
 
         if self.downsample is not None:
-            identity = self.downsample(x)
+            identity = self.downsample(x) #调整形状不匹配
 
         out += identity
         out = self.relu3(out)
         return out
 
-
+#注意力池化层，采用多头自注意力机制（Multi-Head Attention） 来做池化
+#Resnet在提取完特征后通常使用全局平均池化
+#普通池化（GAP）是死板的数学平均；而 AttentionPool2d 则是带偏向性的语义聚拢。
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
+        #代表特征图上所有的像素点总数，+1是专门给 Global Query（全局查询/类似于 Transformer 的 CLS Token） 预留的位置
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
@@ -69,10 +78,15 @@ class AttentionPool2d(nn.Module):
 
     def forward(self, x):
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+        #把后两维（宽高）压缩成一个，并调整维度顺序为[序列长度(HW), Batch大小(N), 通道数(C)]，（这是Transformer期待的输出格式）
+
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+        #在第一个维度（像素）上取平均，算出Global Token；然后把全局平均特征和原本的像素特征拼接在一起
+
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
         x, _ = F.multi_head_attention_forward(
-            query=x[:1], key=x, value=x,
+            query=x[:1], key=x, value=x, #query只传了x的第0项，key与value传了完整的特征
+            #这是一次Targeted Attention。我们只关心“全局特征（Query）”去和“图上所有的像素点（Key）”做匹配。
             embed_dim_to_check=x.shape[-1],
             num_heads=self.num_heads,
             q_proj_weight=self.q_proj.weight,
@@ -90,9 +104,12 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
+        #把在 __init__ 中定义好的各线性层的weight和bias喂给 PyTorch 底层的 C++ 高性能加速函数
         return x.squeeze(0)
+    #由于输出结果 x 的形状是 [1, 32, output_dim]，第一维的 1 已经没有意义了。使用 squeeze(0) 将其消除，最终返回 [32, output_dim]（即 [Batch_Size, 最终视觉向量维度]）
+    #这就是代表整张图片的特征向量，可以直接拿去和文本向量算相似度了。
 
-
+#组装成完整网络 多层 Stem、残差主干构建、前向传播
 class ModifiedResNet(nn.Module):
     """
     A ResNet class that is similar to torchvision's but contains the following changes:
@@ -103,38 +120,53 @@ class ModifiedResNet(nn.Module):
 
     def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
         super().__init__()
-        self.output_dim = output_dim
-        self.input_resolution = input_resolution
+        self.output_dim = output_dim # 最终输出的 CLIP 视觉向量维度（如 512）
+        self.input_resolution = input_resolution # 输入图像的分辨率（默认 224x224）
 
         # the 3-layer stem
+        # 第一层卷积：把 3 通道输入变成 width // 2 (即 32) 通道，高宽减半 (stride=2)
         self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(width // 2)
         self.relu1 = nn.ReLU(inplace=True)
+        # 第二层卷积：保持 32 通道，高宽不变
         self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(width // 2)
         self.relu2 = nn.ReLU(inplace=True)
+        # 第三层卷积：把通道提升到 width (即 64)，高宽不变
         self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
         self.bn3 = nn.BatchNorm2d(width)
         self.relu3 = nn.ReLU(inplace=True)
+        # 平均池化：再次将高宽减半。
         self.avgpool = nn.AvgPool2d(2)
 
+
         # residual layers
+        # 内部状态变量 _inplanes，记录当前特征图的实际通道数，会随着层数加深动态改变
         self._inplanes = width  # this is a *mutable* variable used during construction
-        self.layer1 = self._make_layer(width, layers[0])
-        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
+        # 初始值为 64
+
+        # 构建四大层，逐渐加深通道，缩小高宽
+        self.layer1 = self._make_layer(width, layers[0]) # 出来通道变成 width * 4 = 256
+        self.layer2 = self._make_layer(width * 2, layers[1], stride=2) # 出来通道变成 512, 尺寸减半
         self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
         embed_dim = width * 32  # the ResNet feature dimension
+        # 2048，与 layer4 输出通道一致，告诉池化层每个像素点由一个 2048 维的向量组成
         self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
+        # input_resolution // 32 ：经历前面 5 次下采样（Stem 里 2 次，layer2,3,4各1次），
+        # 224 变为了 224 // 32 = 7。所以最终特征图的分辨率是 7x7
 
+    # 构建重复残差块（Bottleneck）的自动化工具
     def _make_layer(self, planes, blocks, stride=1):
+        # 1. 每一层的第一个块负责调整通道数或缩小高宽（传递了 stride），其需要改变特征图分辨率，同时对接上一层的通道数
         layers = [Bottleneck(self._inplanes, planes, stride)]
-
+        # 2. 算一下第一个块输出后的实际通道数。
         self._inplanes = planes * Bottleneck.expansion
+        # 3. 后续的块（从 1 到 blocks-1）：它们不需要改变尺寸和通道数，只是纯粹加深网络，在相同分辨率下安稳地提取更深层的特征
         for _ in range(1, blocks):
             layers.append(Bottleneck(self._inplanes, planes))
-
+        # 4. 用 nn.Sequential 把这些块打包起来，* 把 layers 列表解包，将里面所有的 Bottleneck 实例按顺序喂给 nn.Sequential 打包并返回
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -145,33 +177,52 @@ class ModifiedResNet(nn.Module):
             x = self.avgpool(x)
             return x
 
+        #确保输入的图像数据类型（比如 FP16、FP32）与卷积层权重的数据类型完全一致
         x = x.type(self.conv1.weight.dtype)
+
+        #让图像通过浅层特征提取层 (Stem)
+        # 输入: [Batch, 3, 224, 224] -> 输出: [Batch, 64, 56, 56]
         x = stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+
+        # 纵穿四个残差层，通道越来越粗，图像分辨率越来越小
+        x = self.layer1(x) # 输出: [Batch, 256, 56, 56]
+        x = self.layer2(x) # 输出: [Batch, 512, 28, 28]
+        x = self.layer3(x) # 输出: [Batch, 1024, 14, 14]
+        x = self.layer4(x) # 输出: [Batch, 2048, 7, 7]
+        # 4. 扔进注意力池化层，提炼出全图的最终语义特征向量
+        # 输出: [Batch, output_dim]（如 [Batch, 512]）
         x = self.attnpool(x)
 
         return x
 
-
+#抗溢出层归一化，继承自 PyTorch 官方的 nn.LayerNorm
+#背景痛点：CLIP 为了极大地提升训练速度并减少显存占用，大量使用了 FP16（半精度浮点数，16位） 进行计算。但是 FP16 的数值表示范围非常窄（最大只能到 65504）。
+#层归一化在内部计算时，需要计算特征的方差，算方差时要进行平方和运算，如果输入 x 的维度很大，很多数平方再相加，其结果极易超过 65504，从而导致 NaN
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
+    #用极小的计算代价换取完美的数值稳定性
     def forward(self, x: torch.Tensor):
-        orig_type = x.dtype
+        orig_type = x.dtype  #输入张量原始的数据类型（通常是 torch.float16）
+
         ret = super().forward(x.type(torch.float32))
+        #  x.type(torch.float32)：在计算前，强制把数据转换为 FP32（单精度浮点数，32位）
+        #    super().forward(...)：调用官方底层的 C++ LayerNorm 函数进行归一化计算
+
         return ret.type(orig_type)
+        # type(orig_type)：计算完毕后，再把结果强制安全地转换回原始的类型（FP16）并返回
 
-
+#极速高斯误差线性单元：GELU（Gaussian Error Linear Unit）是现代 Transformer（如 BERT, GPT）中最标准、最常用的激活函数。但标准的 GELU 计算公式包含误差函数（erf），在硬件底层计算起来非常慢。
+#对标准 GELU 的一种高速数学近似，用 Sigmoid(1.702 * x) 完美地拟合了高斯累积分布函数
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
-        return x * torch.sigmoid(1.702 * x)
+        return x * torch.sigmoid(1.702 * x) #实验证明，这种微小的近似带来的精度损失几乎为零，但却换来了底层计算速度的明显提升
 
-
+#CLIP 模型中 Transformer 块的底层核心实现
+#文本编码器（Text Encoder），还是其ViT版视觉编码器，其内部堆叠的无数个 Standard Transformer Layer，全都是由这个类实例化出来的。
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+        #d_model：特征的隐藏层维度（Hidden Dimension）；n_head：多头注意力机制的头数；attn_mask：注意力掩码（Mask），在文本端极其重要（用于实现 Causal Mask，防止未来的文字泄露给当前位置）
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
