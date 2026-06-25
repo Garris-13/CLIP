@@ -220,47 +220,69 @@ class QuickGELU(nn.Module):
 
 #CLIP 模型中 Transformer 块的底层核心实现
 #文本编码器（Text Encoder），还是其ViT版视觉编码器，其内部堆叠的无数个 Standard Transformer Layer，全都是由这个类实例化出来的。
+# CLIP 里的通用计算砖块，在文本编码器里，它一砖一瓦地堆叠，通过传递特殊的 attn_mask（下三角矩阵），让文字只能看到左边，学到句子的上下文语义；
+# 在 Vision Transformer 里，它同样一砖一瓦地堆叠，但不需要 attn_mask，让打碎的图像 Patch 之间通过自注意力互相通信，拼凑出整张图的全局逻辑。
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         #d_model：特征的隐藏层维度（Hidden Dimension）；n_head：多头注意力机制的头数；attn_mask：注意力掩码（Mask），在文本端极其重要（用于实现 Causal Mask，防止未来的文字泄露给当前位置）
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_head) #直接调用 PyTorch 官方的高性能多头自注意力（Multi-head Self-Attention）模块
+        self.ln_1 = LayerNorm(d_model) #实例化在上一步经过 OpenAI 抗 FP16 溢出魔改的 LayerNorm。这是 Attention 之前的前置层归一化（Pre-LN）。
         self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
-        self.ln_2 = LayerNorm(d_model)
+            ("c_fc", nn.Linear(d_model, d_model * 4)), #c_fc（Fully Connected）：将特征维度从 d_model 放大 4 倍，变为 d_model * 4。
+            ("gelu", QuickGELU()), #gelu：通过极速激活函数 QuickGELU() 进行非线性变换。
+            ("c_proj", nn.Linear(d_model * 4, d_model)) #c_proj（Projection）：再把特征维度从 d_model * 4 压缩回原来的 d_model，以便进行残差相加。
+        ])) #构建前馈网络（Feed-Forward Network / MLP）。同样是典型的“放大再缩小”。
+
+        self.ln_2 = LayerNorm(d_model) #ln_2 是进入 MLP 之前的第二道层归一化；同时将掩码保存为类属性。
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
+        # 1. 动态对齐掩码（Mask）的数据类型和所在设备（CPU/GPU）。
+        #    因为输入 x 可能会因为半精度训练发生类型变化，掩码必须随时跟 x 保持一致，否则报错。
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+
+        # 2. 执行自注意力计算。
+        #    由于是自注意力（Self-Attention），所以 Query, Key, Value 传入的全都是同一个张量 x。
+        #    need_weights=False：告诉 PyTorch 只要计算结果，不需要传回注意力权重矩阵（节省显存）。
+        #    [0]：PyTorch 的 MultiheadAttention 会返回两个东西：(output, weights)，我们只需要第 0 项的 output。
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
+    # Pre-LN（前置归一化）残差结构
     def forward(self, x: torch.Tensor):
+        # 第一阶段：多头自注意力 + 残差连接
         x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        #传统的 Transformer 采用 Post-LN（先 Attention 再 Norm）。
+        #而 GPT 和 CLIP 等现代模型全部采用 Pre-LN（先对 x 做 ln_1 归一化，再送给 attention）。算完之后，直接加回没有被归一化污染的原始 x 上。这样可以确保有一条纯净的“梯度直通高速公路”，极其利于深层网络的稳定训练。
+
+        # 第二阶段：前馈网络（MLP）+ 残差连接
+        x = x + self.mlp(self.ln_2(x)) #同样的逻辑，对经历过第一阶段融合的 x 先做 ln_2 归一化，扔进 mlp 提取高维语义特征，最后再次通过残差连接与未归一化的 x 相加。
         return x
 
-
+#通用的 Transformer 包装盒，OpenAI 只需要给文本端实例化一个 Transformer(width=512, layers=12, ...)，再给视觉端实例化一个 Transformer(width=768, layers=12, ...)
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
-        self.width = width
-        self.layers = layers
+        self.width = width # 特征的隐藏层维度（d_model，如 512 或 768）
+        self.layers = layers # 需要堆叠的 Transformer 核心块的总层数（如 12 层）
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        #[ResidualAttentionBlock(...) for _ in range(layers)]：这是一个 Python 列表推导式。如果 layers=12，它就会在内存里连续创建 12 个独立的、拥有各自权重的 ResidualAttentionBlock 实例，并存入一个 Python 列表中。
+        #星号 * 解包：由于 nn.Sequential 不接受列表作为输入，它只接受一个一个并列的子模块参数。所以通过 * 号把这个拥有 12 个块的列表“拆开”、“解包”成 12 个独立的参数。
+        #nn.Sequential(...) 打包：将解包后的 12 个块按顺序塞进 PyTorch 的顺序容器中。在前向传播时，数据会雷打不动地按照 第0块 ──> 第1块 ──> ... ──> 第11块 的顺序依次纵穿过去。
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
+    #这里的 x 是输入的特征张量（或者是文本端刚加完位置编码的文本 Token，或者是视觉端刚打碎的图像 Patch 向量）。
+    #把 x 扔进刚才打包好的 self.resblocks 顺序流水线里。nn.Sequential 会自发地调用内部每一个 ResidualAttentionBlock 的 forward 函数。
+    # 当 x 从最后一步跳出来时，它已经经历了多次的深层自注意力和MLP的洗礼，已经从表面的离散特征升华为了蕴含深刻上下文语义的高维向量。
 
 
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
-        self.input_resolution = input_resolution
-        self.output_dim = output_dim
+        self.input_resolution = input_resolution # 输入图像分辨率
+        self.output_dim = output_dim # 最终对齐的视觉向量维度（如 512）
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
