@@ -44,18 +44,21 @@ def _download(url: str, root: str):
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
 
+    # 1. 提取 URL 中的哈希值作为预期校验码
     expected_sha256 = url.split("/")[-2]
     download_target = os.path.join(root, filename)
 
+
     if os.path.exists(download_target) and not os.path.isfile(download_target):
         raise RuntimeError(f"{download_target} exists and is not a regular file")
-
+    # 2. 如果本地已经有同名文件了，直接读取并计算哈希，对得上就直接免下载跳过
     if os.path.isfile(download_target):
         if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
             return download_target
         else:
             warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
 
+    # 3. 流式下载：开辟 8192 字节（8KB）的缓冲区配合 tqdm 进度条写入磁盘，防止大模型撑爆内存
     with urllib.request.urlopen(url) as source, open(download_target, "wb") as output:
         with tqdm(total=int(source.info().get("Content-Length")), ncols=80, unit='iB', unit_scale=True, unit_divisor=1024) as loop:
             while True:
@@ -66,6 +69,7 @@ def _download(url: str, root: str):
                 output.write(buffer)
                 loop.update(len(buffer))
 
+    # 4. 下载完再校验一次，防止网络传输中文件损坏（黑客篡改或丢包）
     if hashlib.sha256(open(download_target, "rb").read()).hexdigest() != expected_sha256:
         raise RuntimeError("Model has been downloaded but the SHA256 checksum does not not match")
 
@@ -78,11 +82,11 @@ def _convert_image_to_rgb(image):
 
 def _transform(n_px):
     return Compose([
-        Resize(n_px, interpolation=BICUBIC),
-        CenterCrop(n_px),
-        _convert_image_to_rgb,
-        ToTensor(),
-        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        Resize(n_px, interpolation=BICUBIC), # 1. 缩放：将图像的短边缩放到指定的像素 n_px（如 224），采用高质量的双三次插值（BICUBIC）
+        CenterCrop(n_px), # 2. 中心裁剪：从缩放后的图像正中央抠出一个 n_px * n_px 的正方形
+        _convert_image_to_rgb, # 3. 强制转为 RGB：剥离透明度通道（RGBA）或转灰色图，确保是标准 3 通道图
+        ToTensor(), # 4. 转化为张量：将数值从 [0, 255] 压缩映射到 [0.0, 1.0] 的 torch.Tensor
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)), # 5. 标准化：利用 OpenAI 在 4 亿张互联网图上统计出的专用均值和方差进行归一化
     ])
 
 
@@ -116,6 +120,7 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
     preprocess : Callable[[PIL.Image], torch.Tensor]
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
+    # 判别输入：是官方模型名就去下载，是本地路径就直接读
     if name in _MODELS:
         model_path = _download(_MODELS[name], download_root or os.path.expanduser("~/.cache/clip"))
     elif os.path.isfile(name):
