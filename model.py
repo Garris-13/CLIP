@@ -277,40 +277,46 @@ class Transformer(nn.Module):
     #把 x 扔进刚才打包好的 self.resblocks 顺序流水线里。nn.Sequential 会自发地调用内部每一个 ResidualAttentionBlock 的 forward 函数。
     # 当 x 从最后一步跳出来时，它已经经历了多次的深层自注意力和MLP的洗礼，已经从表面的离散特征升华为了蕴含深刻上下文语义的高维向量。
 
-
+# 把一张静态的图片打碎成一系列“拼图Token”，然后用纯 Transformer 结构来提取图像语义。
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution # 输入图像分辨率
         self.output_dim = output_dim # 最终对齐的视觉向量维度（如 512）
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        #这是 ViT 实现“图片变单词”的经典操作。假设图片是 224x224，patch_size 是 32。这一层卷积核大小是 32×32，步长也是 32。它在图上滑动时，刚好把图切成了 224×224/32/32 = 49$ 块。同时，它直接把这 49 个方块投影到了 width维的通道空间。
 
-        scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
+        scale = width ** -0.5 # 缩放因子，用于稳定权重初始化
+        self.class_embedding = nn.Parameter(scale * torch.randn(width)) # 初始化 [CLS] Token，这是一个可学习的全局图像特征占位符
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width)) # 初始化位置编码。由于有 49 个方块，加上 1 个 [CLS] Token，一共有 50 个位置
+        self.ln_pre = LayerNorm(width) # 进入 Transformer 之前的层归一化
 
-        self.transformer = Transformer(width, layers, heads)
+        self.transformer = Transformer(width, layers, heads) # 实例化多层 ResidualAttentionBlock 组成的 Transformer 引擎
 
-        self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.ln_post = LayerNorm(width) # 走出 Transformer 之后的层归一化
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))# 最后的线性投影矩阵（用矩阵乘法 @ 来做维度映射，将 width 变成 output_dim）
+        #生成一个形状为 (width, output_dim) 的矩阵，其中每个元素都独立地从标准正态分布（均值 0，方差 1）中采样。
 
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        #嵌入 [CLS] Token 与位置编码
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        #创建一个形状为 (batch_size, 1, width) 的全零张量，batch 大小与 x 相同。然会通过广播，将一个一维的分类 token 扩展成 (batch_size, 1, width) 的形状，然后通过 torch.cat 强行“粘”在 49 个特征的最前面。
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)  # NLD -> LND  (NLD (Batch, Length, Dim) -> LND (Length, Batch, Dim))
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
+        #把第 0 号 Token（也就是 [CLS] Token）给切了出来（这里已经“吸干”了后面 49 个图像碎片的全部全局核心语义），然后做一次最后的归一化：ln_post
 
         if self.proj is not None:
-            x = x @ self.proj
+            x = x @ self.proj # 矩阵乘法：将 768 维特征投射到指定的 output_dim
 
         return x
 
@@ -332,8 +338,9 @@ class CLIP(nn.Module):
                  ):
         super().__init__()
 
-        self.context_length = context_length
+        self.context_length = context_length # 文本固定上下文长度
 
+        #如果 vision_layers 传入的是一个元组，说明要构建 ResNet；如果传入的是一个整数，说明要构建由 12 层组成的 Vision Transformer。
         if isinstance(vision_layers, (tuple, list)):
             vision_heads = vision_width * 32 // 64
             self.visual = ModifiedResNet(
@@ -344,7 +351,7 @@ class CLIP(nn.Module):
                 width=vision_width
             )
         else:
-            vision_heads = vision_width // 64
+            vision_heads = vision_width // 64 #（vision_width // 64 是大模型常用的 Heads 设定规律）
             self.visual = VisionTransformer(
                 input_resolution=image_resolution,
                 patch_size=vision_patch_size,
@@ -354,6 +361,8 @@ class CLIP(nn.Module):
                 output_dim=embed_dim
             )
 
+
+        # 实例化文本端的 Transformer 引擎，并传入下面要生成的 attn_mask
         self.transformer = Transformer(
             width=transformer_width,
             layers=transformer_layers,
@@ -362,12 +371,14 @@ class CLIP(nn.Module):
         )
 
         self.vocab_size = vocab_size
-        self.token_embedding = nn.Embedding(vocab_size, transformer_width)
+        self.token_embedding = nn.Embedding(vocab_size, transformer_width) # 词嵌入层
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width)
+        self.ln_final = LayerNorm(transformer_width) # 文本走出 Transformer 后的最终归一化
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim)) # 文本投影矩阵
+        #文本特征出来的维度是 transformer_width（如 512），而视觉出来的特征维度是 embed_dim（如 512）。这两个多模态向量空间必须大小完全一致才能算相似度，这个投影矩阵就是负责把文本维度映射到与视觉对齐的公共空间的桥梁。
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) # 可学习的温度系数 exp(τ)
+        # 初值设为 ln(1 / 0.07) ~= 2.659。后面用 exp() 展开后就是标准对比学习里的常数 1/0.07 ~= 14.28。这是一个可学习的温度调节系数，能让相似度矩阵的数值差异更明显，防止 Softmax 梯度饱和。
 
         self.initialize_parameters()
 
@@ -385,6 +396,7 @@ class CLIP(nn.Module):
 
             for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
                 for name, param in resnet_block.named_parameters():
+                    #在 ResNet 块的最后一层 BatchNorm 上将权重初始化为 0。这是大模型训练的绝招：让网络在刚开始训练时，每个残差块的初始输出就是原始输入（因为主干道被零初始化直接干掉了），这能保证深层网络在刚开局时像浅层网络一样稳定好训。
                     if name.endswith("bn3.weight"):
                         nn.init.zeros_(param)
 
@@ -400,18 +412,22 @@ class CLIP(nn.Module):
         if self.text_projection is not None:
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
+
+    #建立因果掩码（Causal Mask）
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
         mask = torch.empty(self.context_length, self.context_length)
-        mask.fill_(float("-inf"))
+        mask.fill_(float("-inf")) # 全填上负无穷
         mask.triu_(1)  # zero out the lower diagonal
+        # 保持上三角为负无穷，其余下三角和对角线刷成 0
         return mask
 
     @property
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
+    # 输入图片，吐出视觉核心向量（形状：[Batch, embed_dim]）
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
 
@@ -422,90 +438,102 @@ class CLIP(nn.Module):
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        x = self.ln_final(x).type(self.dtype) # 归一化
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-
+        # 精准摘取 EOT (End of Text) 标志位的特征，一句话在被 Tokenize 后，最后一个有效单词后面紧跟的都是结束标记 [EOT]。由于 [EOT] 的 Token ID 在句子里通常数值最大（或者是通过特定规则填充），通过 argmax 就能精准抓到每句话真正结束处的那个索引位置。
         return x
 
     def forward(self, image, text):
-        image_features = self.encode_image(image)
-        text_features = self.encode_text(text)
+        image_features = self.encode_image(image) # 形状: [Batch, embed_dim]
+        text_features = self.encode_text(text) # 形状: [Batch, embed_dim]
 
-        # normalized features
+        # normalized features （L2 Norm）
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
+        #将向量的模长全部缩放到 1。这样后续做矩阵乘法点积时，算出来的结果就是纯粹的余弦相似度（Cosine Similarity），取值严格限制在 [-1, 1] 之间。
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
+        logits_per_image = logit_scale * image_features @ text_features.t() #最终产生一个 [Batch, Batch] 的巨型网格矩阵
         logits_per_text = logits_per_image.t()
 
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
-
+# 将模型的所有权重脱胎换骨地转换为半精度（FP16）以极大地压榨显卡算力
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
 
     def _convert_weights_to_fp16(l):
+        # 如果是常规的卷积层或全连接线性层，直接全转为半精度
         if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
             l.weight.data = l.weight.data.half()
             if l.bias is not None:
                 l.bias.data = l.bias.data.half()
 
+        # 如果是 PyTorch 自带的多头注意力层，把里面所有的投影矩阵权重和偏置全转为半精度
         if isinstance(l, nn.MultiheadAttention):
             for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
                 tensor = getattr(l, attr)
                 if tensor is not None:
                     tensor.data = tensor.data.half()
 
+        # 如果是 CLIP 自定义的一些特定投影矩阵（如文本和视觉的公共空间投影面），也转为半精度
         for name in ["text_projection", "proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
                 if attr is not None:
                     attr.data = attr.data.half()
 
+    # model.apply 是 PyTorch 的内置方法，它会递归地遍历模型里的每一个子模块（Layer），
+    # 并对它们逐一执行 _convert_weights_to_fp16 函数。
     model.apply(_convert_weights_to_fp16)
 
-
+# 扔给它一个预训练好的权重字典 state_dict，它能自己查算出来这个模型当年是用什么参数训练的。
 def build_model(state_dict: dict):
+    # 检查字典里有没有 "visual.proj" 这个键，如果有，说明这是 Vision Transforme派系；如果没有，说明是 ResNet 派系。
     vit = "visual.proj" in state_dict
 
     if vit:
-        vision_width = state_dict["visual.conv1.weight"].shape[0]
-        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
-        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
-        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5)
-        image_resolution = vision_patch_size * grid_size
+        vision_width = state_dict["visual.conv1.weight"].shape[0] # 卷积核的输出通道数，就是视觉特征的宽度 width
+        vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")]) # 多少个注意力权重键，（ ViT 一共有多少层 layers）
+        vision_patch_size = state_dict["visual.conv1.weight"].shape[-1] # 卷积核的单边大小，就是拼图碎片的尺寸 patch_size
+        grid_size = round((state_dict["visual.positional_embedding"].shape[0] - 1) ** 0.5) # 拿位置编码总数减去1（CLS Token占的位置），再开平方，反推出网格单边格子数
+        image_resolution = vision_patch_size * grid_size # 格子数 * 拼图大小 = 原始图像分辨率
     else:
+        # 分别计算 layer1, 2, 3, 4 内部包含了多少个重复的残差块（Bottleneck）
         counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
         vision_layers = tuple(counts)
         vision_width = state_dict["visual.layer1.0.conv1.weight"].shape[0]
+        # 从注意力池化（AttentionPool2d）的位置编码里反推网格大小
         output_width = round((state_dict["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
         vision_patch_size = None
         assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
         image_resolution = output_width * 32
 
-    embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
-    transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+    # 反推文本端和公共空间的参数
+    embed_dim = state_dict["text_projection"].shape[1] # 投影矩阵的输出列数，就是公共对齐空间的维度
+    context_length = state_dict["positional_embedding"].shape[0] # 文本位置编码的行数，就是最大文本长度
+    vocab_size = state_dict["token_embedding.weight"].shape[0] # 词嵌入矩阵的行数，就是词表大小
+    transformer_width = state_dict["ln_final.weight"].shape[0] # 文本最终归一化层的通道数，就是文本 Transformer 的宽度
+    transformer_heads = transformer_width // 64 # 每个 Head 固定分配 64 维，由此反推有多少个 Attention Heads
+    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks"))) # 有多少个文本残差块，得到文本 Transformer 的总层数
 
+    # 把所有反推出来的超参数喂给 CLIP 构造函数，建一个“空壳”模型
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
     )
 
+    ## 删掉权重字典里一些用于记录信息、但不是真正网络权重的元数据键，防止报错
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
 
-    convert_weights(model)
-    model.load_state_dict(state_dict)
-    return model.eval()
+    convert_weights(model) #全面换装 FP16 半精度
+    model.load_state_dict(state_dict) # 把解密好的预训练权重灌注到模型里去
+    return model.eval() #切换到“推理/评估模式”
