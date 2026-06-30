@@ -343,6 +343,7 @@ class CoOp(TrainerX):
 
         return loss_summary
 
+    # 批次解析
     def parse_batch_train(self, batch):
         input = batch["img"]
         label = batch["label"]
